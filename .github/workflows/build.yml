@@ -1,0 +1,33 @@
+name: Build UltraLimit 16X VST3
+
+on:
+push:
+branches: [ main, master ]
+pull_request:
+branches: [ main, master ]
+workflow_dispatch:
+
+jobs:
+build:
+name: Build (${{ matrix.os }})
+runs-on: ${{ matrix.os }}
+strategy:
+fail-fast: false
+matrix:
+os: [windows-latest, macos-latest]
+
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
+
+  - name: Configure CMake
+    run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+  - name: Build VST3 & Standalone
+    run: cmake --build build --config Release --parallel
+
+  - name: Upload VST3 Artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: UltraLimit16X-${{ matrix.os }}
+      path: build/UltraLimit16X_artefacts/Release/
