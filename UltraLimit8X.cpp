@@ -31,11 +31,11 @@ namespace ParamIDs
     const juce::String ceiling     { "ceiling" };
     const juce::String lookahead   { "lookahead" };
     const juce::String release     { "release" };
-    const juce::String autoRelease { "autoRelease" }; // Auto-Release Schalter
+    const juce::String autoRelease { "autoRelease" };
     const juce::String stereoLink  { "stereoLink" };
-    const juce::String oversample  { "oversample" };  // 16x Linear FIR On/Off
+    const juce::String oversample  { "oversample" };
     const juce::String dither      { "dither" };
-    const juce::String autoGain    { "autoGain" };    // 1:1 Audition (Unity Gain Monitor)
+    const juce::String autoGain    { "autoGain" };
 }
 
 // ==============================================================================
@@ -80,9 +80,6 @@ private:
     int writeIndex = 0;
 };
 
-/**
- * First-Order High-Pass Noise-Shaped TPDF Dithering Generator
- */
 class TPDFDither
 {
 public:
@@ -90,7 +87,6 @@ public:
 
     void reset() { lastError = 0.0f; }
 
-    // mode: 0 = Off, 1 = 24-Bit NS, 2 = 16-Bit NS
     inline float process(float sample, int mode)
     {
         if (mode == 0) return sample;
@@ -102,7 +98,6 @@ public:
         float r2 = dist(rng);
         float tpdf = (r1 + r2) * 0.5f * qStep;
 
-        // First-order error feedback verschiebt Quantisierungsrauschen in hohe Frequenzen
         float shapedInput = sample + 0.5f * lastError + tpdf;
         float quantized = std::round(shapedInput / qStep) * qStep;
         lastError = sample - quantized;
@@ -117,7 +112,7 @@ private:
 };
 
 // ==============================================================================
-// 3. AUDIO PROCESSOR (ULTRA-TRANSPARENT 16X / 64X DSP ENGINE)
+// 3. AUDIO PROCESSOR (ULTRA-TRANSPARENT 16X DSP ENGINE)
 // ==============================================================================
 class UltraLimitAudioProcessor : public juce::AudioProcessor
 {
@@ -128,7 +123,6 @@ public:
             .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
           apvts(*this, nullptr, "PARAMETERS", createParameterLayout())
     {
-        // 16-faches Linear-Phase Equiripple FIR Oversampling (2^4 = 16x)
         oversampler16x = std::make_unique<juce::dsp::Oversampling<float>>(
             2, 4,
             juce::dsp::Oversampling<float>::filterHalfBandEquirippleFIR,
@@ -185,7 +179,6 @@ public:
         oversampler16x->initProcessing(static_cast<size_t>(samplesPerBlock));
         oversampler16x->reset();
 
-        // Maximale Lookahead-Zeit (10 ms) im 16-fach überabgetasteten Raum
         int maxOversampledDelay = static_cast<int>(std::ceil(sampleRate * 16.0 * 0.015));
         for (int ch = 0; ch < 2; ++ch)
         {
@@ -233,7 +226,6 @@ public:
 
         if (numSamples == 0 || totalNumInputChannels == 0) return;
 
-        // Parameter auslesen
         float inputGainDb  = apvts.getRawParameterValue(ParamIDs::inputGain)->load();
         float ceilingDb    = apvts.getRawParameterValue(ParamIDs::ceiling)->load();
         float lookaheadMs  = apvts.getRawParameterValue(ParamIDs::lookahead)->load();
@@ -246,12 +238,12 @@ public:
 
         double osFactor = osEnabled ? 16.0 : 1.0;
 
-        smoothedInputGain.setTargetValue(juce::Decibels::decibelsToGain(inputGainDb));
+        float targetInGainLinear = juce::Decibels::decibelsToGain(inputGainDb);
+        smoothedInputGain.setTargetValue(targetInGainLinear);
         smoothedCeiling.setTargetValue(juce::Decibels::decibelsToGain(ceilingDb));
 
         updateLatency();
 
-        // 1. Input Gain anwenden & Input Peak messen
         float maxInPeak = 0.0f;
         for (int i = 0; i < numSamples; ++i)
         {
@@ -265,7 +257,6 @@ public:
         }
         currentInputPeak.store(maxInPeak);
 
-        // 2. 16x Linear-Phase FIR Oversampling
         juce::dsp::AudioBlock<float> baseBlock(buffer);
         juce::dsp::AudioBlock<float> processingBlock = osEnabled
             ? oversampler16x->processSamplesUp(baseBlock)
@@ -276,24 +267,20 @@ public:
 
         int lookaheadSamples = static_cast<int>((lookaheadMs / 1000.0) * effectiveSampleRate);
 
-        // Ultra-transparente Attack-Glättung
         float attackCoeff = (lookaheadSamples > 1)
             ? std::exp(-1.0f / (static_cast<float>(lookaheadSamples) * 0.32f))
             : 0.0f;
 
-        // Release-Zeitkonstanten (Manuell & Program-Dependent Auto-Release)
         float manualRelCoeff = std::exp(-1.0f / static_cast<float>((releaseMs / 1000.0) * effectiveSampleRate));
-        float autoFastCoeff  = std::exp(-1.0f / static_cast<float>(0.012 * effectiveSampleRate)); // 12 ms für Transienten
-        float autoSlowCoeff  = std::exp(-1.0f / static_cast<float>(0.280 * effectiveSampleRate)); // 280 ms für Sustain/Bass
+        float autoFastCoeff  = std::exp(-1.0f / static_cast<float>(0.012 * effectiveSampleRate));
+        float autoSlowCoeff  = std::exp(-1.0f / static_cast<float>(0.280 * effectiveSampleRate));
         float rmsCoeff       = std::exp(-1.0f / static_cast<float>(0.050 * effectiveSampleRate));
 
-        // Winzige Sicherheitsmarge (-0.02 dB), damit das FIR-Downsampling garantiert ohne Clipping unter dem Ceiling bleibt
         float ceilingLinear = smoothedCeiling.getCurrentValue() * 0.9977f;
         float maxBlockGR = 1.0f;
 
         const int numChannels = static_cast<int>(std::min<size_t>(2, processingBlock.getNumChannels()));
 
-        // 3. Reiner, unverfälschter Transparent-Limiter im 16x Raum
         for (size_t i = 0; i < osNumSamples; ++i)
         {
             float instantSamples[2] = { 0.0f, 0.0f };
@@ -313,7 +300,6 @@ public:
                     targetGain[ch] = 1.0f;
             }
 
-            // Stereo-Linking
             if (numChannels == 2)
             {
                 float minGain = std::min(targetGain[0], targetGain[1]);
@@ -321,14 +307,12 @@ public:
                 targetGain[1] = targetGain[1] * (1.0f - stereoLink) + minGain * stereoLink;
             }
 
-            // Hüllkurvenverfolger (Auto-Release vs. Manueller Release)
             for (int ch = 0; ch < numChannels; ++ch)
             {
                 float sq = instantSamples[ch] * instantSamples[ch];
                 rmsEnvelope[ch] = rmsCoeff * rmsEnvelope[ch] + (1.0f - rmsCoeff) * sq;
                 float rmsLevel = std::sqrt(rmsEnvelope[ch]);
 
-                // Langsame Basis-Hüllkurve für Auto-Release (verhindert Pumpen bei anhaltender Kompression)
                 if (targetGain[ch] < slowEnvelopeGain[ch])
                     slowEnvelopeGain[ch] = autoFastCoeff * slowEnvelopeGain[ch] + (1.0f - autoFastCoeff) * targetGain[ch];
                 else
@@ -337,7 +321,6 @@ public:
                 float activeReleaseCoeff = manualRelCoeff;
                 if (autoRel)
                 {
-                    // Crest-Faktor & Dichte bestimmen: Kurze Transienten erholen sich schnell, dichtes Material langsam
                     float crestAdapt = juce::jlimit(0.0f, 1.0f, (rmsLevel / std::max(0.01f, ceilingLinear)) * 1.35f);
                     activeReleaseCoeff = autoFastCoeff * (1.0f - crestAdapt) + autoSlowCoeff * crestAdapt;
                 }
@@ -349,7 +332,6 @@ public:
                     else
                         envelopeGain[ch] = targetGain[ch];
 
-                    // Absoluter True-Peak-Schutz im 16x-Raum
                     float delayedAbs = std::abs(delayedSamples[ch]);
                     if (delayedAbs * envelopeGain[ch] > ceilingLinear)
                         envelopeGain[ch] = ceilingLinear / delayedAbs;
@@ -368,9 +350,19 @@ public:
             }
         }
 
-        // 4. Linear-Phase FIR Downsampling zurück auf Basis-Samplerate
         if (osEnabled)
             oversampler16x->processSamplesDown(baseBlock);
+
+        // 5. Output-Stufe (1:1 Audition Kompensation & Noise-Shaped TPDF Dither)
+        float unityCompGain = (unityMonitor && targetInGainLinear > 0.0001f) ? (1.0f / targetInGainLinear) : 1.0f;
+        float maxOutPeak = 0.0f;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            for (int ch = 0; ch < std::min(2, totalNumInputChannels); ++ch)
+            {
+                float s = buffer.getSample(ch, i) * unityCompGain;
+                if (ditherMode > 0)
                     s = ditherers[ch].process(s, ditherMode);
 
                 buffer.setSample(ch, i, s);
@@ -378,7 +370,6 @@ public:
             }
         }
 
-        // Metering-Werte aktualisieren
         float grDb = juce::Decibels::gainToDecibels(maxBlockGR);
         currentOutputPeak.store(maxOutPeak);
         currentGainReductionDb.store(grDb);
@@ -389,9 +380,6 @@ public:
         historyWriteIndex.store((hIdx + 1) % historySize);
     }
 
-    // ==========================================================================
-    // PLUGIN METADATEN & EDITOR-ANBINDUNG
-    // ==========================================================================
     const juce::String getName() const override { return "UltraLimit 16X"; }
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
@@ -816,9 +804,6 @@ private:
     int holdCounter   = 0;
 };
 
-/**
- * Haupt-Editor für UltraLimit 64X (Puristisches, transparentes Mastering-Layout)
- */
 class UltraLimitAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
@@ -827,8 +812,11 @@ public:
     {
         setLookAndFeel(&proLookAndFeel);
         setSize(820, 500);
+        brushedMetalBg = BrushedMetalTexture::create(820, 500);
 
-        // 5 essentielle Mastering-Regler + Auto-Release Button
+        addAndMakeVisible(waveformDisplay);
+        addAndMakeVisible(sideMeter);
+
         setupKnob(inputGainSlider,  inputGainLabel,  "GAIN",        ParamIDs::inputGain,  inputGainAtt);
         setupKnob(ceilingSlider,    ceilingLabel,    "OUTPUT",      ParamIDs::ceiling,    ceilingAtt);
         setupKnob(lookaheadSlider,  lookaheadLabel,  "LOOKAHEAD",   ParamIDs::lookahead,  lookaheadAtt);
@@ -840,7 +828,6 @@ public:
         autoReleaseAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
             audioProcessor.apvts, ParamIDs::autoRelease, autoReleaseButton);
 
-        // Bottom Bar Controls: 1:1 Audition, 16x Linear FIR, Dither
         unityGainButton.setButtonText("1:1 AUDITION");
         addAndMakeVisible(unityGainButton);
         unityGainAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
@@ -878,7 +865,6 @@ public:
         g.setColour(juce::Colour(0xaa000000));
         g.drawHorizontalLine(getHeight() - 1, 0.0f, static_cast<float>(getWidth()));
 
-        // Top-Plakette
         juce::ColourGradient headerGrad(juce::Colour(0xff232832), 0, 0,
                                         juce::Colour(0xff12151b), 0, 42.0f, false);
         g.setGradientFill(headerGrad);
@@ -899,12 +885,10 @@ public:
         g.setFont(juce::Font(11.0f, juce::Font::bold));
         g.drawText("ULTRA-TRANSPARENT TRUE PEAK LIMITER", 180, 0, 290, 42, juce::Justification::centredLeft);
 
-        // Badge rechts oben
         g.setColour(juce::Colour(0xff38bdf8));
         g.setFont(juce::Font(10.5f, juce::Font::bold));
         g.drawText("16X LINEAR FIR • AUTO RELEASE", getWidth() - 285, 0, 250, 42, juce::Justification::centredRight);
 
-        // Gefrästes Control-Deck
         auto deckRect = juce::Rectangle<float>(14.0f, 274.0f, static_cast<float>(getWidth() - 106), 178.0f);
         juce::ColourGradient deckGrad(juce::Colour(0xff13161c), 0, deckRect.getY(),
                                       juce::Colour(0xff1b2029), 0, deckRect.getBottom(), false);
@@ -916,7 +900,6 @@ public:
         g.setColour(juce::Colour(0x26ffffff));
         g.drawRoundedRectangle(deckRect.expanded(1.0f), 11.0f, 1.0f);
 
-        // 4 Studio-Rack-Schrauben
         BrushedMetalTexture::drawChassisScrew(g, 16.0f, 21.0f, 6.5f);
         BrushedMetalTexture::drawChassisScrew(g, static_cast<float>(getWidth() - 16), 21.0f, 6.5f);
         BrushedMetalTexture::drawChassisScrew(g, 16.0f, static_cast<float>(getHeight() - 18), 6.5f);
@@ -940,7 +923,6 @@ public:
         auto displayArea = bounds.removeFromTop(224).reduced(14, 10);
         waveformDisplay.setBounds(displayArea);
 
-        // Symmetrisches 5-Regler-Deck: Links (Lookahead, Release + Auto) | Mitte (GAIN) | Rechts (Link, Output)
         auto deck = bounds.reduced(24, 12);
         int sideKnobW = 104;
         int mainKnobW = 164;
